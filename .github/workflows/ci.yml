@@ -1,0 +1,251 @@
+name: Release
+
+# Workflow of the public mirror https://github.com/s4core/s4cli.
+# It is installed there as .github/workflows/ci.yml by the "Push to GitHub"
+# job of the private Gitea CI; this file is never published as it is.
+#
+# The public repository only builds and publishes: fmt, clippy, the unit
+# tests and the S3 integration scripts all run in the private Gitea CI
+# before a tag is ever created.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            deb_arch: amd64
+            strip: strip
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            deb_arch: arm64
+            strip: aarch64-linux-gnu-strip
+    env:
+      # Used by the aarch64 build; ignored by the x86_64 one.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the cross-linker
+        if: matrix.deb_arch == 'arm64'
+        # s4 has no crate dependencies and no build script, so a C cross-linker
+        # for the final link is all that aarch64 needs.
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set the version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0+$(git rev-parse --short HEAD)"
+          fi
+          echo "Building version ${VERSION}"
+          sed -i "0,/^version = .*/s|^version = .*|version = \"${VERSION}\"|" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package the tarball
+        run: |
+          BIN="target/${{ matrix.target }}/release/s4"
+          ${{ matrix.strip }} "$BIN"
+          file "$BIN"
+          mkdir -p dist
+          tar czf "dist/s4-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" s4
+
+      - name: Package the .deb
+        run: |
+          BIN="target/${{ matrix.target }}/release/s4"
+          PKG="$(mktemp -d)/s4"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/doc/s4"
+
+          install -m 0755 "$BIN" "$PKG/usr/bin/s4"
+          install -m 0644 LICENSE "$PKG/usr/share/doc/s4/copyright"
+          install -m 0644 README.md "$PKG/usr/share/doc/s4/README.md"
+
+          cat > "$PKG/DEBIAN/control" <<CONTROL
+          Package: s4
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${{ matrix.deb_arch }}
+          Depends: curl (>= 7.55.0), python3
+          Maintainer: Dmitry Rakov <d.rakov@s4core.com>
+          Homepage: https://github.com/s4core/s4cli
+          Description: mc-style command line client for S3 storage
+           s4 is the companion client for the S4 object storage server and works
+           with any S3-compatible endpoint: buckets, objects, multipart uploads,
+           sync, versioning, object lock and the bucket configuration commands.
+           .
+           It has no library dependencies: HTTP goes through curl and the SigV4
+           signature through python3, both of which it expects on the system.
+          CONTROL
+
+          dpkg-deb --root-owner-group --build "$PKG" "dist/s4_${VERSION}_${{ matrix.deb_arch }}.deb"
+          dpkg-deb --info "dist/s4_${VERSION}_${{ matrix.deb_arch }}.deb"
+          dpkg-deb --contents "dist/s4_${VERSION}_${{ matrix.deb_arch }}.deb"
+
+      - name: Checksums
+        run: |
+          cd dist
+          for f in *.tar.gz *.deb; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -l
+
+      - name: Verify the packaged binary
+        if: matrix.deb_arch == 'amd64'
+        run: |
+          tar xzf "dist/s4-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/s4" --version
+          test "$("$RUNNER_TEMP/s4" --version)" = "s4 ${VERSION}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: s4-*
+          merge-multiple: true
+          path: dist
+
+      - name: List the release files
+        run: ls -l dist
+
+      - name: Generate release notes
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          RELEASE_DATE="$(date -u +'%Y.%-m.%-d')"
+          NOTES_FILE=".github/release-notes/${TAG_NAME}.md"
+
+          if [ -f "${NOTES_FILE}" ]; then
+            echo "Using ${NOTES_FILE} for the release notes."
+            cp "${NOTES_FILE}" release-notes.md
+          else
+            if git rev-parse -q --verify "refs/tags/${TAG_NAME}^{tag}" >/dev/null; then
+              echo "Using the annotated tag message for the release notes."
+              RELEASE_MSG="$(git for-each-ref "refs/tags/${TAG_NAME}" --format='%(contents)')"
+            else
+              echo "Using the tagged commit message for the release notes."
+              RELEASE_MSG="$(git log -1 --format='%B' HEAD)"
+            fi
+            SUBJECT="$(printf '%s\n' "${RELEASE_MSG}" | sed -n '/[^[:space:]]/ {p; q;}')"
+
+            # A message that already is markdown is kept as it is.
+            RAW_MARKDOWN=false
+            if printf '%s\n' "${RELEASE_MSG}" | grep -Eq '^(#{1,6}[[:space:]]|[*-][[:space:]]+\*\*)'; then
+              RAW_MARKDOWN=true
+            fi
+
+            if [ "${RAW_MARKDOWN}" = "true" ]; then
+              printf '%s\n' "${RELEASE_MSG}" > release-notes.md
+            else
+              # Drop the commit trailers: they are noise in public release notes.
+              BODY="$(printf '%s\n' "${RELEASE_MSG}" | sed '1d' \
+                | sed -E '/^[[:space:]]*(Co-[Aa]uthored-[Bb]y|Signed-off-by):/d' \
+                | sed '/^[[:space:]]*$/d')"
+              CLEAN_SUBJECT="$(printf '%s' "${SUBJECT}" | sed -E 's/^[a-zA-Z]+(\([^)]+\))?!?:[[:space:]]*//')"
+              {
+                echo "### ${RELEASE_DATE}"
+                echo ""
+                echo "### Changes"
+                echo ""
+                echo "- ${CLEAN_SUBJECT}"
+                if [ -n "${BODY}" ]; then
+                  printf '%s\n' "${BODY}" | sed -E 's/^[[:space:]]*[-*][[:space:]]*/- /'
+                fi
+              } > release-notes.md
+            fi
+          fi
+
+          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
+          {
+            if [ "$(tail -c 1 release-notes.md | wc -c)" -ne 0 ]; then
+              echo ""
+            fi
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "Debian/Ubuntu (amd64 or arm64):"
+            echo ""
+            echo '```sh'
+            echo "curl -LO ${BASE}/s4_${VERSION}_amd64.deb"
+            echo "sudo apt install ./s4_${VERSION}_amd64.deb"
+            echo '```'
+            echo ""
+            echo "Any Linux, from the tarball:"
+            echo ""
+            echo '```sh'
+            echo "curl -LO ${BASE}/s4-linux-\$(uname -m).tar.gz"
+            echo "tar xzf s4-linux-\$(uname -m).tar.gz && sudo install -m 0755 s4 /usr/local/bin/s4"
+            echo '```'
+            echo ""
+            echo "\`s4\` needs \`curl\` (7.55+) and \`python3\` on the machine it runs on."
+            echo ""
+            echo "### Artifacts"
+            echo ""
+            echo "| File | Target |"
+            echo "| --- | --- |"
+            echo "| \`s4-linux-x86_64.tar.gz\` | Linux x86_64 |"
+            echo "| \`s4-linux-aarch64.tar.gz\` | Linux aarch64 (arm64) |"
+            echo "| \`s4_${VERSION}_amd64.deb\` | Debian/Ubuntu amd64 |"
+            echo "| \`s4_${VERSION}_arm64.deb\` | Debian/Ubuntu arm64 |"
+            echo ""
+            echo "Each file has a \`.sha256\` next to it."
+          } >> release-notes.md
+
+          echo "Generated release notes:"
+          cat release-notes.md
+
+      # The notes come first, then GitHub's generated changelog.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          generate_release_notes: true
+          files: dist/*

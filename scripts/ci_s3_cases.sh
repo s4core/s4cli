@@ -249,9 +249,9 @@ if target/debug/s4 -C "$CFG_DIR" legalhold set "ci/$LH_BUCKET/lh.txt" > "$WORKDI
   target/debug/s4 -C "$CFG_DIR" get "ci/$LH_BUCKET/lh.txt" "$LH_GOT"
   cmp -s "$LH_LOCAL" "$LH_GOT"
   # Some object-lock servers deny DELETE without versionId even when governance bypass is used.
-  # Best-effort object delete first, then rely on `rb` version-purge path for authoritative cleanup.
-  target/debug/s4 -C "$CFG_DIR" rm "ci/$LH_BUCKET/lh.txt" > "$WORKDIR/legalhold-rm.out" 2>&1 || true
-  if target/debug/s4 -C "$CFG_DIR" rb "ci/$LH_BUCKET" > "$WORKDIR/legalhold-rb.out" 2>&1; then
+  # Best-effort object delete first, then rely on `rb --force` version purge for authoritative cleanup.
+  target/debug/s4 -C "$CFG_DIR" rm --bypass "ci/$LH_BUCKET/lh.txt" > "$WORKDIR/legalhold-rm.out" 2>&1 || true
+  if target/debug/s4 -C "$CFG_DIR" rb --force --bypass "ci/$LH_BUCKET" > "$WORKDIR/legalhold-rb.out" 2>&1; then
     cat "$WORKDIR/legalhold-rb.out"
   else
     cat "$WORKDIR/legalhold-rb.out" >&2
@@ -267,8 +267,7 @@ else
   if is_object_lock_unsupported_error "$WORKDIR/legalhold-set.out"; then
     echo "[ci] skipping legalhold/retention checks: object lock is not enabled/supported on remote bucket" >&2
     mark_capability_skipped "object-lock"
-    target/debug/s4 -C "$CFG_DIR" rm "ci/$LH_BUCKET/lh.txt" || true
-    target/debug/s4 -C "$CFG_DIR" rb "ci/$LH_BUCKET" || true
+    target/debug/s4 -C "$CFG_DIR" rb --force --bypass "ci/$LH_BUCKET" || true
   else
     exit 1
   fi
@@ -334,7 +333,12 @@ else
   EP_PORT="80"
 fi
 
-target/debug/s4 -C "$CFG_DIR"   --resolve "${EP_HOST}:${EP_PORT}=${EP_HOST}"   --limit-download "1G"   --custom-header "x-s4-ci: globals"   ls ci > "$WORKDIR/globals-ls.out"
+# curl's --resolve wants an address in the last field, so an endpoint given by
+# name (a container or a DNS name) has to be looked up first; an IP maps to itself.
+EP_ADDR="$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$EP_HOST" 2>/dev/null || true)"
+EP_ADDR="${EP_ADDR:-$EP_HOST}"
+
+target/debug/s4 -C "$CFG_DIR"   --resolve "${EP_HOST}:${EP_PORT}=${EP_ADDR}"   --limit-download "1G"   --custom-header "x-s4-ci: globals"   ls ci > "$WORKDIR/globals-ls.out"
 
 # ping/ready coverage
 target/debug/s4 -C "$CFG_DIR" ping ci > "$WORKDIR/ping.out"
@@ -512,6 +516,57 @@ target/debug/s4 -C "$CFG_DIR" get "ci/$SRC_BUCKET/mp/large.bin" "$MP_GOT"
 cmp -s "$MP_LOCAL" "$MP_GOT"
 target/debug/s4 -C "$CFG_DIR" rm "ci/$SRC_BUCKET/mp/large.bin"
 
+# regression cases for previously broken behavior
+REG="$WORKDIR/regression"
+mkdir -p "$REG"
+
+# a failed download must not clobber an existing local file
+echo "IMPORTANT" > "$REG/keep.txt"
+if target/debug/s4 -C "$CFG_DIR" get "ci/$SRC_BUCKET/does-not-exist.txt" "$REG/keep.txt" 2> "$REG/get-missing.err"; then
+  echo "[ci] get of a missing key unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -qx "IMPORTANT" "$REG/keep.txt"
+has_pattern "NoSuchKey|status 404" "$REG/get-missing.err"
+
+# sync --remove must not delete destination objects skipped by --exclude
+target/debug/s4 -C "$CFG_DIR" put "$EXCL_LOCAL" "ci/$DST_BUCKET/exclude-keep/2024/local.tmp"
+target/debug/s4 -C "$CFG_DIR" sync --remove --exclude "*.tmp" "ci/$SRC_BUCKET/photos" "ci/$DST_BUCKET/exclude-keep"
+target/debug/s4 -C "$CFG_DIR" stat "ci/$DST_BUCKET/exclude-keep/2024/local.tmp" > /dev/null
+
+# a repeated sync with the same flags copies nothing
+target/debug/s4 -C "$CFG_DIR" sync --exclude "*.tmp" "ci/$SRC_BUCKET/photos" "ci/$DST_BUCKET/exclude-keep" > "$REG/resync.out"
+has_pattern "Synced 0 object" "$REG/resync.out"
+
+# nested prefixes (with '/') are signed correctly
+target/debug/s4 -C "$CFG_DIR" find "ci/$SRC_BUCKET/photos/2024/" > "$REG/find-nested.out"
+has_pattern "photos/2024/a.txt" "$REG/find-nested.out"
+
+# --json output is valid JSON even for raw HTTP headers
+target/debug/s4 -C "$CFG_DIR" --json stat "ci/$SRC_BUCKET/photos/2024/a.txt" \
+  | python3 -c 'import json, sys; json.load(sys.stdin)'
+
+# cat is binary safe
+python3 -c 'import os, sys; sys.stdout.buffer.write(os.urandom(200000))' > "$REG/bin.dat"
+target/debug/s4 -C "$CFG_DIR" put "$REG/bin.dat" "ci/$SRC_BUCKET/regression/bin.dat"
+target/debug/s4 -C "$CFG_DIR" cat "ci/$SRC_BUCKET/regression/bin.dat" > "$REG/bin.out"
+cmp -s "$REG/bin.dat" "$REG/bin.out"
+
+# listings beyond 1000 keys follow continuation tokens
+seq 1 1005 | xargs -P 8 -I{} target/debug/s4 -C "$CFG_DIR" put "$SRC1" "ci/$SRC_BUCKET/many/k{}" > /dev/null
+MANY_COUNT="$(target/debug/s4 -C "$CFG_DIR" find "ci/$SRC_BUCKET/many" | wc -l)"
+if [[ "$MANY_COUNT" -ne 1005 ]]; then
+  echo "[ci] expected 1005 keys, listed $MANY_COUNT" >&2
+  exit 1
+fi
+
+# rb refuses a non-empty bucket unless --force is given
+if target/debug/s4 -C "$CFG_DIR" rb "ci/$SRC_BUCKET" 2> "$REG/rb.err"; then
+  echo "[ci] rb removed a non-empty bucket without --force" >&2
+  exit 1
+fi
+has_pattern "use --force" "$REG/rb.err"
+
 target/debug/s4 -C "$CFG_DIR" rm "ci/$SRC_BUCKET/photos/2024/a.txt"
 target/debug/s4 -C "$CFG_DIR" rm "ci/$SRC_BUCKET/photos/2024/b.txt"
 target/debug/s4 -C "$CFG_DIR" rm "ci/$SRC_BUCKET/photos/2024/exclude.tmp"
@@ -531,8 +586,8 @@ target/debug/s4 -C "$CFG_DIR" rm "ci/$SRC_BUCKET/sql/data.csv"
 
 purge_bucket_objects_best_effort "ci" "$SRC_BUCKET"
 purge_bucket_objects_best_effort "ci" "$DST_BUCKET"
-target/debug/s4 -C "$CFG_DIR" rb "ci/$SRC_BUCKET"
-target/debug/s4 -C "$CFG_DIR" rb "ci/$DST_BUCKET"
+target/debug/s4 -C "$CFG_DIR" rb --force "ci/$SRC_BUCKET"
+target/debug/s4 -C "$CFG_DIR" rb --force "ci/$DST_BUCKET"
 target/debug/s4 -C "$CFG_DIR" alias rm ci
 
 if (( ${#NOT_IMPLEMENTED_ON_SERVER[@]} > 0 )); then
