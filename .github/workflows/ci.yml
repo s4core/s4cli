@@ -25,26 +25,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             arch: x86_64
             deb_arch: amd64
-            strip: strip
-          - target: aarch64-unknown-linux-gnu
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
             arch: aarch64
             deb_arch: arm64
-            strip: aarch64-linux-gnu-strip
+            platform: linux/arm64
     env:
-      # Used by the aarch64 build; ignored by the x86_64 one.
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      # Static musl binaries: they run on any Linux whatever its glibc is, and
+      # rust-lld links both architectures without a C cross-toolchain.
+      RUSTFLAGS: -C linker=rust-lld -C strip=symbols
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install the cross-linker
-        if: matrix.deb_arch == 'arm64'
-        # s4 has no crate dependencies and no build script, so a C cross-linker
-        # for the final link is all that aarch64 needs.
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -74,7 +69,6 @@ jobs:
       - name: Package the tarball
         run: |
           BIN="target/${{ matrix.target }}/release/s4"
-          ${{ matrix.strip }} "$BIN"
           file "$BIN"
           mkdir -p dist
           tar czf "dist/s4-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" s4
@@ -89,6 +83,7 @@ jobs:
           install -m 0644 LICENSE "$PKG/usr/share/doc/s4/copyright"
           install -m 0644 README.md "$PKG/usr/share/doc/s4/README.md"
 
+          # The binary is static, so curl and python3 are the whole dependency list.
           cat > "$PKG/DEBIAN/control" <<CONTROL
           Package: s4
           Version: ${VERSION}
@@ -119,12 +114,18 @@ jobs:
           done
           ls -l
 
+      - name: Set up QEMU
+        if: matrix.deb_arch != 'amd64'
+        uses: docker/setup-qemu-action@v3
+
       - name: Verify the packaged binary
-        if: matrix.deb_arch == 'amd64'
+        # Alpine has no glibc at all: running there proves the binary is static.
         run: |
           tar xzf "dist/s4-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/s4" --version
-          test "$("$RUNNER_TEMP/s4" --version)" = "s4 ${VERSION}"
+          OUT=$(docker run --rm --platform ${{ matrix.platform }} \
+            -v "$RUNNER_TEMP/s4:/s4:ro" alpine:latest /s4 --version)
+          echo "$OUT"
+          test "$OUT" = "s4 ${VERSION}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
